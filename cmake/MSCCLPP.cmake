@@ -68,7 +68,7 @@ if(ENABLE_MSCCLPP)
            WORKING_DIRECTORY ${MSCCLPP_SOURCE}
         )
 	execute_process(
-           COMMAND git apply ${CMAKE_CURRENT_SOURCE_DIR}/ext-src/read-allred.patch
+           COMMAND git apply ${CMAKE_CURRENT_SOURCE_DIR}/ext-src/cpx-64.patch
            WORKING_DIRECTORY ${MSCCLPP_SOURCE}
         )
 
@@ -100,7 +100,7 @@ if(ENABLE_MSCCLPP)
         	WORKING_DIRECTORY ${MSCCLPP_SOURCE}
     	)
 	execute_process(
-           COMMAND git apply --reverse ${CMAKE_CURRENT_SOURCE_DIR}/ext-src/read-allred.patch
+           COMMAND git apply --reverse ${CMAKE_CURRENT_SOURCE_DIR}/ext-src/cpx-64.patch
            WORKING_DIRECTORY ${MSCCLPP_SOURCE}
         )
     endif()
