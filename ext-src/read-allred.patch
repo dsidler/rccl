@@ -1,5 +1,5 @@
 diff --git a/apps/nccl/src/allreduce.hpp b/apps/nccl/src/allreduce.hpp
-index 1cd7f30..dceb105 100644
+index 1cd7f30..7980476 100644
 --- a/apps/nccl/src/allreduce.hpp
 +++ b/apps/nccl/src/allreduce.hpp
 @@ -440,12 +440,333 @@ __global__ void __launch_bounds__(512, 1)
@@ -349,14 +349,13 @@ index 1cd7f30..dceb105 100644
        nThreadsPerBlock = (nelems <= 76800) ? 512 : 1024;
      }
      allreduce7<<<nBlocks, nThreadsPerBlock, 0, stream>>>(buff, scratch, resultBuff, smChannels, channelInOffset,
-@@ -466,12 +787,24 @@ cudaError_t allreduce(T* buff, T* scratch, T* resultBuff, mscclpp::DeviceHandle<
+@@ -466,11 +787,22 @@ cudaError_t allreduce(T* buff, T* scratch, T* resultBuff, mscclpp::DeviceHandle<
    } else {
      int nBlocks = 35;
      int nThreadsPerBlock = 512;
 -    allreduce8<<<nBlocks, nThreadsPerBlock, 0, stream>>>(buff, scratch, resultBuff, smChannels, smOutChannels,
 -                                                         channelOutOffset, channelScratchOffset, rank, nRanksPerNode,
 -                                                         worldSize, nelems);
--  }
 +    if (hieAllred && worldSize >= 8) {
 +      nBlocks = 20;
 +      allreduce10<<<nBlocks, nThreadsPerBlock, 0, stream>>>(buff, scratch, resultBuff, smChannels, smScrChannels,
@@ -372,13 +371,11 @@ index 1cd7f30..dceb105 100644
 +            buff, resultBuff, smChannels, smOutChannels, channelOutOffset, rank, nRanksPerNode, worldSize, nelems);
 +      }
 +    }
- 
--  return cudaGetLastError();
-+    return cudaGetLastError();
-+  }
+   }
+-
+   return cudaGetLastError();
  }
  
- #endif  // ALLREDUCE_KERNEL_H
 diff --git a/apps/nccl/src/common.hpp b/apps/nccl/src/common.hpp
 index 015e0a2..ca2c272 100644
 --- a/apps/nccl/src/common.hpp
