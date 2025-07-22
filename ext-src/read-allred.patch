@@ -1,8 +1,8 @@
 diff --git a/apps/nccl/src/allreduce.hpp b/apps/nccl/src/allreduce.hpp
-index 4134241..76674ba 100644
+index 4134241..63a05a6 100644
 --- a/apps/nccl/src/allreduce.hpp
 +++ b/apps/nccl/src/allreduce.hpp
-@@ -495,24 +495,345 @@ __global__ void __launch_bounds__(512, 1)
+@@ -495,24 +495,427 @@ __global__ void __launch_bounds__(512, 1)
    }
  }
  
@@ -107,22 +107,38 @@ index 4134241..76674ba 100644
 +
 +template <typename T>
 +__global__ void __launch_bounds__(1024, 1)
-+    allreduce10(T* buff, T* scratch, T* resultBuff, mscclpp::DeviceHandle<mscclpp::SmChannel>* smChannels,
-+                    mscclpp::DeviceHandle<mscclpp::SmChannel>* smScrChannels,
++    allreduce9(T* buff, T* resultBuff, mscclpp::DeviceHandle<mscclpp::SmChannel>* smChannels,
 +               mscclpp::DeviceHandle<mscclpp::SmChannel>* smOutChannels, size_t channelOutDataOffset,
-+               size_t channelScratchOffset, int rank, int nRanksPerNode, int worldSize, size_t nelems) {
-+  const int nPeer = nRanksPerNode - 1;
-+  const size_t chanOffset = nPeer * blockIdx.x;
-+  // assume (nelems * sizeof(T)) is divisible by (16 * worldSize)
-+  const size_t nInt4 = nelems * sizeof(T) / sizeof(int4);
-+  const size_t nInt4PerRank = nInt4 / NRANKS1_PER_NODE;
++               int rank, int nRanksPerNode, int worldSize, size_t nelems) {
++  
++  const size_t nBlock = gridDim.x;
++  if (blockIdx.x >= nBlock) return;
 +
-+  auto smChans = smChannels + chanOffset;
-+  auto smOutChans = smOutChannels + chanOffset;
-+  auto smScrChans = smScrChannels + chanOffset;
++  const size_t warpId = threadIdx.x / WARP_SIZE;
++  const size_t warpThreadId = threadIdx.x % WARP_SIZE;
++  const size_t nWarps = blockDim.x / WARP_SIZE;
++  __shared__ uint64_t local_chunks_produced[MAX_WARP_PER_BLOCK]; // At most warps per block
++  __shared__ uint64_t global_chunks_produced;
++
++  printf("nRanksPerNode %lu %worldSize %lu\n", nRanksPerNode, worldSize);
++
++  const size_t nPeer = worldSize - 1;
++  const size_t nNodes = 8;
++  const size_t nLocalRanks = nRanksPerNode;// / nNodes;
++  const size_t nLocalPeers = nLocalRanks - 1;
++  const size_t nRemotePeers = nNodes - 1;
++
++  const size_t chanOffset = nPeer * blockIdx.x;
++  auto memChans = smChannels + chanOffset;
++
++
++  const size_t nInt4 = nelems * sizeof(int) / sizeof(int4);
++  const size_t nInt4PerRank = nInt4 / worldSize;
++  const size_t nInt4PerNode = nInt4PerRank * nLocalRanks;
++  const size_t nodeId = rank / nRanksPerNode;
++  const size_t localRank = rank % nRanksPerNode;
 +
 +  int4* buff4 = reinterpret_cast<int4*>(buff);
-+  int4* scratch4 = reinterpret_cast<int4*>((char*)scratch + channelScratchOffset);
 +  int4* resultBuff4 = reinterpret_cast<int4*>(resultBuff);
 +
 +  // Distribute `nInt4PerRank` across all blocks with the unit size `unitNInt4`
@@ -132,9 +148,8 @@ index 4134241..76674ba 100644
 +  size_t offsetOfThisBlock = maxNInt4PerBlock * blockIdx.x;
 +  size_t nInt4OfThisBlock = maxNInt4PerBlock;
 +  size_t nNeededBlocks = (nInt4PerRank + maxNInt4PerBlock - 1) / maxNInt4PerBlock;
-+
-+  constexpr size_t nInt4PerChunk = 1024 * 1024 / sizeof(int4);  // 256KB
-+  int num_nodes = worldSize/NRANKS1_PER_NODE;
++  // Use smaller chunk size for inner collective
++  constexpr size_t nInt4PerChunk = 1024 * 64 / sizeof(int4);
 +
 +  if (blockIdx.x >= nNeededBlocks) {
 +    nInt4OfThisBlock = 0;
@@ -145,184 +160,251 @@ index 4134241..76674ba 100644
 +  const size_t nItrs = nInt4OfThisBlock / nInt4PerChunk;
 +  const size_t restNInt4 = nInt4OfThisBlock % nInt4PerChunk;
 +
-+  const size_t blockOffset = nInt4PerChunk * blockIdx.x;
-+
-+  int localRank = rank % NRANKS1_PER_NODE;
-+
-+  __shared__ mscclpp::DeviceHandle<mscclpp::SmChannel> channels[NRANKS_PER_NODE - 1];
-+  __shared__ mscclpp::DeviceHandle<mscclpp::SmChannel> outChannels[NRANKS_PER_NODE - 1];
-+  __shared__ mscclpp::DeviceHandle<mscclpp::SmChannel> scrChannels[NRANKS_PER_NODE - 1];
-+
-+  const int lid = threadIdx.x % WARP_SIZE;
-+  if (lid < nPeer) {
-+    channels[lid] = smChans[lid];
-+    outChannels[lid] = smOutChans[lid];
-+    scrChannels[lid] = smScrChans[lid];
++  // have to initialize variables in lds here otherwise syncthreads will not work
++  if (threadIdx.x < 16) {
++    if (threadIdx.x == 0) {
++      global_chunks_produced = 0;
++    }
++    local_chunks_produced[threadIdx.x] = 0;
 +  }
-+  __syncwarp();
++  if (threadIdx.x < static_cast<uint32_t>(nLocalPeers)) {
++    const size_t peerIdx = (nodeId * nLocalRanks) + threadIdx.x;
++    memChans[peerIdx].relaxedSignal();
++    memChans[peerIdx].wait();
++  }
++  __syncthreads();
 +
-+  // we can use double buffering to hide synchronization overhead
-+  for (size_t itr = 0; itr < nItrs; itr++) {
-+    if (threadIdx.x < (NRANKS1_PER_NODE-1)) {
-+        int myNode = rank/NRANKS1_PER_NODE;
-+        int remote = (threadIdx.x + 1 + rank);
-+        int remoteNode = remote/NRANKS1_PER_NODE;
++  const size_t nLocalThreadsPerBlock = blockDim.x - WARP_SIZE;
 +
-+        if (remoteNode > myNode) {
-+                remote = remote - NRANKS1_PER_NODE;
-+        }
-+        int peerIdx = remote < rank ? remote : remote - 1;
-+        outChannels[peerIdx].signal();
-+        outChannels[peerIdx].wait();
-+    }
-+    __syncthreads();
 +
-+    int myNode = rank/NRANKS1_PER_NODE;
-+
-+     //Reduce within an OAM
-+    for (size_t idx = threadIdx.x; idx < nInt4PerChunk; idx += blockDim.x) {
-+      int4 data = buff4[nInt4PerRank * localRank + idx + offsetOfThisBlock];
-+      for (int peerIdx = NRANKS1_PER_NODE*myNode; peerIdx < (NRANKS1_PER_NODE*myNode +
-+                              NRANKS1_PER_NODE - 1); peerIdx++)      {
-+        int4 val = channels[peerIdx].read<int4>(nInt4PerRank  * localRank + offsetOfThisBlock + idx);
-+        data = add_vectors<T>(val, data);
-+      }
-+      scratch4[idx + blockOffset] = data;
-+    }
-+
-+    if (threadIdx.x < static_cast<uint32_t>(num_nodes-1)) {
-+        int remote = (NRANKS1_PER_NODE * (threadIdx.x + 1) + rank) % worldSize;
-+        int peerIdx = remote < rank ? remote : remote - 1;
-+        scrChannels[peerIdx].signal();
-+        scrChannels[peerIdx].wait();
-+    }
-+    __syncthreads();
-+
-+    //Reduce across OAMs
-+
-+    for (size_t idx = threadIdx.x; idx < nInt4PerChunk; idx += blockDim.x) {
-+      int4 data = scratch4[idx + blockOffset];
-+
-+      for (int peerIdx = 0; peerIdx < NPEERS; peerIdx++) {
-+        const int remoteRank = (peerIdx < rank) ? peerIdx : peerIdx + 1;
-+        int myLocal = rank % NRANKS1_PER_NODE;
-+        int remoteLocal = remoteRank % NRANKS1_PER_NODE;
-+
-+        if (myLocal == remoteLocal) {
-+                int4 val = scrChannels[peerIdx].read<int4>(blockOffset + idx +
-+                                channelScratchOffset/sizeof(int4));
-+                data = add_vectors<T>(val, data);
++  // Warps working on Local RS and AG
++  if (warpId < (nWarps - 1)) {
++    size_t produced_chunk = 0;
++    // Local ReduceScatter
++    for (size_t i = 0; i < nItrs; ++i) {
++      for (size_t nodeIdx = 0; nodeIdx < nNodes; nodeIdx++) {
++        for (size_t idx = threadIdx.x; idx < nInt4PerChunk; idx += nLocalThreadsPerBlock) {
++          int4 data = buff4[(nInt4PerNode * nodeIdx) + (nInt4PerRank * localRank) + offsetOfThisBlock + idx];
++          // #pragma unroll
++          for (size_t localPeerIdx = 0; localPeerIdx < nLocalPeers; localPeerIdx++) {
++            const size_t peerIdx = (nodeId * nLocalRanks) + localPeerIdx;
++            int4 val = memChans[peerIdx].read<int4>((nInt4PerNode * nodeIdx) + (nInt4PerRank * localRank) + offsetOfThisBlock + idx);
++            data = add_vectors<int>(val, data);
++          }
++          buff4[(nInt4PerNode * nodeIdx) + (nInt4PerRank * localRank) + offsetOfThisBlock + idx] = data;
 +        }
 +      }
++      // Notify global warp
++      if (warpThreadId == 0) {
++        local_chunks_produced[warpId]++;
++      }
++      offsetOfThisBlock += nInt4PerChunk;
++    }
 +
-+      resultBuff4[nInt4PerRank * localRank + idx + offsetOfThisBlock] = data;
-+
-+      for (int peerIdx = NRANKS1_PER_NODE*myNode; peerIdx < (NRANKS1_PER_NODE*myNode + NRANKS1_PER_NODE - 1); peerIdx++)      {
-+        outChannels[peerIdx].write(nInt4PerRank * localRank + idx + offsetOfThisBlock +
-+                        channelOutDataOffset / sizeof(int4), data);
++    if (restNInt4 > 0) {
++      for (size_t nodeIdx = 0; nodeIdx < nNodes; nodeIdx++) {
++        for (size_t idx = threadIdx.x; idx < restNInt4; idx += nLocalThreadsPerBlock) {
++          int4 data = buff4[(nInt4PerNode * nodeIdx) + nInt4PerRank * localRank + offsetOfThisBlock + idx];
++          // #pragma unroll
++          for (size_t localPeerIdx = 0; localPeerIdx < nLocalPeers; localPeerIdx++) {
++            const size_t peerIdx = (nodeId * nLocalRanks) + localPeerIdx;
++            int4 val = memChans[peerIdx].read<int4>((nInt4PerNode * nodeIdx) + nInt4PerRank * localRank + offsetOfThisBlock + idx);
++            data = add_vectors<int>(val, data);
++          }
++          buff4[(nInt4PerNode * nodeIdx) + nInt4PerRank * localRank + offsetOfThisBlock + idx] = data;
++        }
++      }
++      // Notify global warp
++      if (warpThreadId == 0) {
++        local_chunks_produced[warpId] = ++produced_chunk;
 +      }
 +    }
 +
-+    if (threadIdx.x < static_cast<uint32_t>(nPeer)) {
-+      outChannels[threadIdx.x].signal();
-+      outChannels[threadIdx.x].wait();
-+    }
-+    __syncthreads();
++    // Local AllGather
++    size_t expected_chunk = 0;
++    offsetOfThisBlock = maxNInt4PerBlock * blockIdx.x;
++    for (size_t i = 0; i < nItrs; ++i) {
++      // Wait for chunk to be produced by global warp
++      while (__hip_atomic_load(&global_chunks_produced, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_WORKGROUP) == expected_chunk) {}
++      expected_chunk++;
 +
-+    offsetOfThisBlock += nInt4PerChunk;
++      for (size_t nodeIdx = 0; nodeIdx < nNodes; nodeIdx++) {
++        for (size_t idx = threadIdx.x; idx < nInt4PerChunk; idx += nLocalThreadsPerBlock) {
++          int4 data = buff4[(nInt4PerNode * nodeIdx) + (nInt4PerRank * localRank) + offsetOfThisBlock + idx];
++          // #pragma unroll
++          for (size_t localPeerIdx = 0; localPeerIdx < nLocalPeers; localPeerIdx++) {
++            const size_t peerIdx = (nodeId * nLocalRanks) + localPeerIdx;
++            memChans[peerIdx].write<int4>((nInt4PerNode * nodeIdx) + (nInt4PerRank * localRank) + offsetOfThisBlock + idx, data);
++          }
++        }
++      }
++      offsetOfThisBlock += nInt4PerChunk;
++    }
++
++    if (restNInt4 > 0) {
++
++      // Wait for chunk to be produced by global warp
++      size_t chunks_produced;
++      do {
++        chunks_produced = __hip_atomic_load(&global_chunks_produced, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_WORKGROUP);
++      } while(chunks_produced == expected_chunk);
++      expected_chunk++;
++
++      for (size_t nodeIdx = 0; nodeIdx < nNodes; nodeIdx++) {
++        for (size_t idx = threadIdx.x; idx < restNInt4; idx += nLocalThreadsPerBlock) {
++          int4 data = buff4[(nInt4PerNode * nodeIdx) + nInt4PerRank * localRank + offsetOfThisBlock + idx];
++          // #pragma unroll
++          for (size_t localPeerIdx = 0; localPeerIdx < nLocalPeers; localPeerIdx++) {
++            const size_t peerIdx = (nodeId * nLocalRanks) + localPeerIdx;
++            memChans[peerIdx].write<int4>((nInt4PerNode * nodeIdx) + nInt4PerRank * localRank + offsetOfThisBlock + idx, data);
++          }
++        }
++      }
++    }
++  } else { // Warp for global RS + AG
++
++    offsetOfThisBlock = maxNInt4PerBlock * blockIdx.x;
++    size_t expected_chunk = 0;
++    // Global ReduceScatter
++    for (size_t i = 0; i < nItrs; ++i) {
++      // Wait for local warps to produce local RS output
++      uint64_t chunks_produced;
++      do {
++        if (warpThreadId >= (nWarps - 1))
++          break;
++        chunks_produced = __hip_atomic_load(&(local_chunks_produced[warpThreadId]), __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_WORKGROUP);
++      } while(chunks_produced == expected_chunk);
++      expected_chunk++;
++
++      // Sync with global peers before doing AllReduce on this chunk
++      // TODO assume the whole warp works together
++      if (warpThreadId < static_cast<uint32_t>(nRemotePeers)) {
++        const size_t peerNodeIdx = (warpThreadId < nodeId) ? warpThreadId : (warpThreadId + 1);
++        size_t peerIdx = (peerNodeIdx * nLocalRanks) + localRank;
++        if (peerIdx > rank) peerIdx--;
++        memChans[peerIdx].signal();
++        memChans[peerIdx].wait();
++      }
++
++
++      for (size_t idx = warpThreadId; idx < nInt4PerChunk; idx += WARP_SIZE) {
++        int4 data = buff4[(nInt4PerNode * nodeId) + (nInt4PerRank * localRank) + offsetOfThisBlock + idx];
++        // #pragma unroll
++        for (size_t remotePeerIdx = 0; remotePeerIdx < nRemotePeers; remotePeerIdx++) {
++          const size_t peerNodeIdx = (remotePeerIdx < nodeId) ? remotePeerIdx : (remotePeerIdx + 1);
++          size_t peerIdx = (peerNodeIdx * nLocalRanks) + localRank;
++          if (peerIdx > rank) peerIdx--;
++          int4 val = memChans[peerIdx].read<int4>((nInt4PerNode * nodeId) + (nInt4PerRank * localRank) +
++                                                  offsetOfThisBlock + idx);
++          data = add_vectors<int>(val, data);
++        }
++        //Send reduction out
++        // #pragma unroll
++        for (size_t remotePeerIdx = 0; remotePeerIdx < nRemotePeers; remotePeerIdx++) {
++          const size_t peerNodeIdx = (remotePeerIdx < nodeId) ? remotePeerIdx : (remotePeerIdx + 1);
++          size_t peerIdx = (peerNodeIdx * nLocalRanks) + localRank;
++          if (peerIdx > rank) peerIdx--;
++          memChans[peerIdx].write<int4>((nInt4PerNode * nodeId) + (nInt4PerRank * localRank) +
++                                                  offsetOfThisBlock + idx, data);
++        }
++        // Store reduction locally
++        resultBuff4[(nInt4PerNode * nodeId) + (nInt4PerRank * localRank) + offsetOfThisBlock + idx] = data;
++      }
++      // __builtin_amdgcn_s_waitcnt(0);
++
++      if (warpThreadId < static_cast<uint32_t>(nRemotePeers)) {
++        const size_t peerNodeIdx = (warpThreadId < nodeId) ? warpThreadId : (warpThreadId + 1);
++        size_t peerIdx = (peerNodeIdx * nLocalRanks) + localRank;
++        if (peerIdx > rank) peerIdx--;
++        memChans[peerIdx].signal();
++        memChans[peerIdx].wait();
++      }
++      // Notify local warps that AG can be done
++      if (warpThreadId == 0) {
++        global_chunks_produced = expected_chunk;
++      }
++      offsetOfThisBlock += nInt4PerChunk;
++    }
++
++    if (restNInt4 > 0) {
++      // Wait for local warps to produce local RS output
++      uint64_t chunks_produced;
++      do {
++        if (warpThreadId >= (nWarps - 1))
++          break;
++        chunks_produced = __hip_atomic_load(&(local_chunks_produced[warpThreadId]), __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_WORKGROUP);
++      } while(chunks_produced == expected_chunk);
++      expected_chunk++;
++
++      if (warpThreadId < static_cast<uint32_t>(nRemotePeers)) {
++        const size_t peerNodeIdx = (warpThreadId < nodeId) ? warpThreadId : (warpThreadId + 1);
++        size_t peerIdx = (peerNodeIdx * nLocalRanks) + localRank;
++        if (peerIdx > rank) peerIdx--;
++        memChans[peerIdx].signal();
++        memChans[peerIdx].wait();
++      }
++
++      for (size_t idx = warpThreadId; idx < restNInt4; idx += WARP_SIZE) {
++        int4 data = buff4[(nInt4PerNode * nodeId) + (nInt4PerRank * localRank) + offsetOfThisBlock + idx];
++        // #pragma unroll
++        for (size_t remotePeerIdx = 0; remotePeerIdx < nRemotePeers; remotePeerIdx++) {
++          const size_t peerNodeIdx = (remotePeerIdx < nodeId) ? remotePeerIdx : (remotePeerIdx + 1);
++          size_t peerIdx = (peerNodeIdx * nLocalRanks) + localRank;
++          if (peerIdx > rank) peerIdx--;
++          int4 val = memChans[peerIdx].read<int4>((nInt4PerNode * nodeId) + nInt4PerRank * localRank +
++                                                  offsetOfThisBlock + idx);
++          data = add_vectors<int>(val, data);
++        }
++
++        //Send reduction out
++        // #pragma unroll
++        for (size_t remotePeerIdx = 0; remotePeerIdx < nRemotePeers; remotePeerIdx++) {
++          const size_t peerNodeIdx = (remotePeerIdx < nodeId) ? remotePeerIdx : (remotePeerIdx + 1);
++          size_t peerIdx = (peerNodeIdx * nLocalRanks) + localRank;
++          if (peerIdx > rank) peerIdx--;
++          memChans[peerIdx].write<int4>((nInt4PerNode * nodeId) + (nInt4PerRank * localRank) +
++                                                  offsetOfThisBlock + idx, data);
++        }
++        // Store reduction locally
++        resultBuff4[(nInt4PerNode * nodeId) + (nInt4PerRank * localRank) + offsetOfThisBlock + idx] = data;
++      }
++
++      if (warpThreadId < static_cast<uint32_t>(nRemotePeers)) {
++        const size_t peerNodeIdx = (warpThreadId < nodeId) ? warpThreadId : (warpThreadId + 1);
++        size_t peerIdx = (peerNodeIdx * nLocalRanks) + localRank;
++        if (peerIdx > rank) peerIdx--;
++        memChans[peerIdx].signal();
++        memChans[peerIdx].wait();
++      }
++      // Notify local warps that AG can be done
++      if (warpThreadId == 0) {
++        global_chunks_produced = expected_chunk;
++      }
++    }
++
 +  }
 +
-+  if (restNInt4 > 0) {
-+    if (threadIdx.x < (NRANKS1_PER_NODE-1)) {
-+        int myNode = rank/NRANKS1_PER_NODE;
-+        int remote = (threadIdx.x + 1 + rank);
-+        int remoteNode = remote/NRANKS1_PER_NODE;
-+
-+        if (remoteNode > myNode) {
-+                remote = remote - NRANKS1_PER_NODE;
-+        }
-+        int peerIdx = remote < rank ? remote : remote - 1;
-+
-+        outChannels[peerIdx].signal();
-+        outChannels[peerIdx].wait();
-+    }
-+    __syncthreads();
-+
-+    for (size_t idx = threadIdx.x; idx < restNInt4; idx += blockDim.x) {
-+      int4 data = buff4[nInt4PerRank * localRank + idx + offsetOfThisBlock];
-+      for (int peerIdx = 0; peerIdx < NPEERS; peerIdx++) {
-+        const int remoteRank = (peerIdx < rank) ? peerIdx : peerIdx + 1;
-+
-+        int myNode = rank/NRANKS1_PER_NODE;
-+        int remoteNode = remoteRank/NRANKS1_PER_NODE;
-+
-+        if (myNode == remoteNode) {
-+                int4 val = channels[peerIdx].read<int4>(nInt4PerRank  * localRank + offsetOfThisBlock + idx);
-+                data = add_vectors<T>(val, data);
-+        }
-+      }
-+      scratch4[idx + blockOffset] = data;
-+    }
-+
-+    if (threadIdx.x < static_cast<uint32_t>(num_nodes-1)) {
-+        int remote = (NRANKS1_PER_NODE * (threadIdx.x + 1) + rank) % worldSize;
-+        int peerIdx = remote < rank ? remote : remote - 1;
-+        scrChannels[peerIdx].signal();
-+        scrChannels[peerIdx].wait();
-+    }
-+    __syncthreads();
-+
-+    for (size_t idx = threadIdx.x; idx < restNInt4; idx += blockDim.x) {
-+        int4 data = scratch4[idx + blockOffset];
-+
-+        for (int peerIdx = 0; peerIdx < NPEERS; peerIdx++) {
-+            const int remoteRank = (peerIdx < rank) ? peerIdx : peerIdx + 1;
-+            int myLocal = rank % NRANKS1_PER_NODE;
-+            int remoteLocal = remoteRank % NRANKS1_PER_NODE;
-+
-+            if (myLocal == remoteLocal) {
-+                int4 val = scrChannels[peerIdx].read<int4>(blockOffset + idx +
-+                                channelScratchOffset/sizeof(int4));
-+                data = add_vectors<T>(val, data);
-+            }
-+        }
-+
-+       resultBuff4[nInt4PerRank * localRank + idx + offsetOfThisBlock] = data;
-+	for (int peerIdx = 0; peerIdx < NPEERS; peerIdx++) {
-+            const int remoteRank = (peerIdx < rank) ? peerIdx : peerIdx + 1;
-+            int myNode = rank/NRANKS1_PER_NODE;
-+            int remoteNode = remoteRank/NRANKS1_PER_NODE;
-+
-+            if (myNode == remoteNode) {
-+                outChannels[peerIdx].write(nInt4PerRank * localRank + idx + offsetOfThisBlock +
-+                                channelOutDataOffset / sizeof(int4), data);
-+            }
-+        }
-+    }
-+    if (threadIdx.x < static_cast<uint32_t>(nPeer)) {
-+      outChannels[threadIdx.x].signal();
-+      outChannels[threadIdx.x].wait();
-+    }
-+    __syncthreads();
-+
++  __syncthreads();
++  if (threadIdx.x < static_cast<uint32_t>(nPeer)) {
++    memChans[threadIdx.x].signal();
++    memChans[threadIdx.x].wait();
 +  }
-+
 +}
 +
  template <typename T>
  cudaError_t allreduce(T* buff, T* scratch, T* resultBuff, mscclpp::DeviceHandle<mscclpp::SmChannel>* smChannels,
 -                      mscclpp::DeviceHandle<mscclpp::SmChannel>* smOutChannels, size_t channelInOffset,
 +                      mscclpp::DeviceHandle<mscclpp::SmChannel>* smScrChannels,
-+		      mscclpp::DeviceHandle<mscclpp::SmChannel>* smOutChannels, size_t channelInOffset,
++		                  mscclpp::DeviceHandle<mscclpp::SmChannel>* smOutChannels, size_t channelInOffset,
                        size_t channelOutOffset, size_t channelScratchOffset, int rank, int nRanksPerNode, int worldSize,
                        size_t nelems, cudaStream_t stream) {
    static uint32_t flag = 1;
 +  int readAllred = 0, hieAllred = 0;
 +  char* envValue = nullptr;
 +  char* envValue1 = nullptr;
- 
-+  nRanksPerNode = (worldSize < nRanksPerNode) ? worldSize : nRanksPerNode;
 +
++  nRanksPerNode = (worldSize < nRanksPerNode) ? worldSize : nRanksPerNode;
+ 
 +  envValue = std::getenv("MSCCLPP_READ_ALLRED");
 +  envValue1 = std::getenv("MSCCLPP_HIERARCHICAL_ALLRED");
 +
@@ -355,7 +437,7 @@ index 4134241..76674ba 100644
        nThreadsPerBlock = (nelems <= 76800) ? 512 : 1024;
      }
  #if defined(ENABLE_NPKIT)
-@@ -526,11 +847,23 @@ cudaError_t allreduce(T* buff, T* scratch, T* resultBuff, mscclpp::DeviceHandle<
+@@ -526,11 +929,23 @@ cudaError_t allreduce(T* buff, T* scratch, T* resultBuff, mscclpp::DeviceHandle<
                                                           flag++);
  #endif
    } else {
@@ -366,14 +448,14 @@ index 4134241..76674ba 100644
 -                                                         channelOutOffset, channelScratchOffset, rank, nRanksPerNode,
 -                                                         worldSize, nelems);
 +    if (hieAllred && worldSize >= 8) {
-+	nBlocks = 20;
-+	allreduce10<<<nBlocks, nThreadsPerBlock, 0, stream>>>(buff, scratch, resultBuff, smChannels, smScrChannels,
-+			smOutChannels, channelOutOffset, channelScratchOffset, rank, nRanksPerNode,
-+			worldSize, nelems);
++      nThreadsPerBlock = 576;
++      nBlocks = 16;
++      allreduce9<<<nBlocks, nThreadsPerBlock, 0, stream>>>(buff, resultBuff, smChannels,
++        smOutChannels, channelOutOffset, rank, nRanksPerNode, worldSize, nelems);
 +    } else {
 +      if (!readAllred) {
 +         allreduce8<<<nBlocks, nThreadsPerBlock, 0, stream>>>(buff, scratch, resultBuff, smScrChannels,
-+		smOutChannels, channelOutOffset, channelScratchOffset, rank, nRanksPerNode,
++		            smOutChannels, channelOutOffset, channelScratchOffset, rank, nRanksPerNode,
 +               worldSize, nelems);
 +      } else {
 +	    allreduce8Read<<<nBlocks, nThreadsPerBlock, 0, stream>>>(buff, resultBuff, smChannels, smOutChannels,
@@ -384,13 +466,14 @@ index 4134241..76674ba 100644
  
    return cudaGetLastError();
 diff --git a/apps/nccl/src/common.hpp b/apps/nccl/src/common.hpp
-index 015e0a2..ca2c272 100644
+index 015e0a2..de53ea1 100644
 --- a/apps/nccl/src/common.hpp
 +++ b/apps/nccl/src/common.hpp
-@@ -13,6 +13,7 @@
+@@ -13,6 +13,8 @@
  #define WARP_SIZE 32
  #endif
  
++constexpr size_t MAX_WARP_PER_BLOCK = 1024 / WARP_SIZE;
 +constexpr int NRANKS1_PER_NODE = 4;
  constexpr int NRANKS_PER_NODE = 8;
  constexpr int NPEERS = 7;
