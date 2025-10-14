@@ -1,5 +1,5 @@
 diff --git a/apps/nccl/src/allreduce.hpp b/apps/nccl/src/allreduce.hpp
-index 1b85136..066a16d 100644
+index 1b85136..5d4a903 100644
 --- a/apps/nccl/src/allreduce.hpp
 +++ b/apps/nccl/src/allreduce.hpp
 @@ -224,7 +224,7 @@ __global__ void __launch_bounds__(1024, 1)
@@ -45,7 +45,7 @@ index 1b85136..066a16d 100644
          const int peerIdx = (i + blockIdx.x) % nPeer;
          const int remoteRank = (peerIdx < rank) ? peerIdx : peerIdx + 1;
          int4 val = buff4[nInt4PerRank * remoteRank + idx + offsetOfThisBlock];
-@@ -372,13 +372,13 @@ __global__ void __launch_bounds__(512, 1)
+@@ -372,26 +372,382 @@ __global__ void __launch_bounds__(512, 1)
  
      for (size_t idx = threadIdx.x; idx < restNInt4; idx += blockDim.x) {
        int4 data = buff4[nInt4PerRank * rank + idx + offsetOfThisBlock];
@@ -58,13 +58,13 @@ index 1b85136..066a16d 100644
        resultBuff4[nInt4PerRank * rank + idx + offsetOfThisBlock] = data;
 -      for (int peerIdx = 0; peerIdx < nPeer; peerIdx++) {
 +      for (int peerIdx = 0; peerIdx < NPEER; peerIdx++) {
-         outChannels[peerIdx].write(nInt4PerRank * rank + idx + offsetOfThisBlock + channelOutDataOffset / sizeof(int4),
-                                    data);
-       }
-@@ -386,12 +386,330 @@ __global__ void __launch_bounds__(512, 1)
-   }
- }
- 
++        outChannels[peerIdx].write(nInt4PerRank * rank + idx + offsetOfThisBlock + channelOutDataOffset / sizeof(int4),
++                                   data);
++      }
++    }
++  }
++}
++
 +template <typename T>
 +__global__ void __launch_bounds__(512, 1)
 +    allreduce8Read(T* buff, T* resultBuff, mscclpp::DeviceHandle<mscclpp::SmChannel>* smChannels,
@@ -119,7 +119,6 @@ index 1b85136..066a16d 100644
 +      int4 data = buff4[nInt4PerRank * rank + idx + offsetOfThisBlock];
 +      for (int peerIdx = 0; peerIdx < NPEER; peerIdx++) {
 +        int4 val = channels[peerIdx].read<int4>(nInt4PerRank * rank + offsetOfThisBlock + idx);
-+        ;
 +        data = add_vectors<T>(val, data);
 +      }
 +      resultBuff4[nInt4PerRank * rank + idx + offsetOfThisBlock] = data;
@@ -154,10 +153,10 @@ index 1b85136..066a16d 100644
 +      }
 +      resultBuff4[nInt4PerRank * rank + idx + offsetOfThisBlock] = data;
 +      for (int peerIdx = 0; peerIdx < NPEER; peerIdx++) {
-+        outChannels[peerIdx].write(nInt4PerRank * rank + idx + offsetOfThisBlock + channelOutDataOffset / sizeof(int4),
-+                                   data);
-+      }
-+    }
+         outChannels[peerIdx].write(nInt4PerRank * rank + idx + offsetOfThisBlock + channelOutDataOffset / sizeof(int4),
+                                    data);
+       }
+     }
 +
 +    if (threadIdx.x < static_cast<uint32_t>(nPeer)) {
 +      outChannels[threadIdx.x].signal();
@@ -182,12 +181,16 @@ index 1b85136..066a16d 100644
 +  const uint32_t nWarps = blockDim.x / WARP_SIZE;
 +  __shared__ uint64_t local_chunks_produced[MAX_WARP_PER_BLOCK];  // At most warps per block
 +  __shared__ uint64_t global_chunks_produced;
++  __shared__ uint64_t global_warps_start_semaphore;
++  __shared__ uint64_t global_warps_end_semaphore;
 +
 +  const int nPeer = worldSize - 1;
 +  const int nNodes = worldSize / NRANKS_PER_NODE;
 +  const int nLocalRanks = NRANKS_PER_NODE;
 +  const int nLocalPeers = NPEER;
 +  const int nRemotePeers = nNodes - 1;
++  const uint32_t nLocalWarps = 8;
++  const uint32_t nGlobalWarps = nWarps - nLocalWarps;
 +
 +  const size_t chanOffset = nPeer * blockIdx.x;
 +  // assume (nelems * sizeof(T)) is divisible by (16 * worldSize)
@@ -236,6 +239,8 @@ index 1b85136..066a16d 100644
 +  if (threadIdx.x < 16) {
 +    if (threadIdx.x == 0) {
 +      global_chunks_produced = 0;
++      global_warps_start_semaphore = 0;
++      global_warps_end_semaphore = 0;
 +    }
 +    local_chunks_produced[threadIdx.x] = 0;
 +  }
@@ -246,11 +251,12 @@ index 1b85136..066a16d 100644
 +  }
 +  __syncthreads();
 +
-+  const size_t nLocalThreadsPerBlock = blockDim.x - WARP_SIZE;
++  const size_t nLocalThreadsPerBlock = nLocalWarps * WARP_SIZE;
++  const size_t nGlobalThreadsPerBlock = nGlobalWarps * WARP_SIZE;
 +  const size_t nChunksToProcess = nItrs + (restNInt4 != 0);
 +
 +  // Warps working on Local RS and AG
-+  if (warpId < (nWarps - 1)) {
++  if (warpId < nLocalWarps) {
 +    size_t produced_chunk = 0;
 +    // Local ReduceScatter
 +    for (size_t i = 0; i < nChunksToProcess; ++i) {
@@ -304,31 +310,50 @@ index 1b85136..066a16d 100644
 +
 +    offsetOfThisBlock = maxNInt4PerBlock * blockIdx.x;
 +    size_t expected_chunk = 0;
++    const uint32_t globalThreadId = threadIdx.x - nLocalThreadsPerBlock;
 +    // Global ReduceScatter
 +    for (size_t i = 0; i < nChunksToProcess; ++i) {
 +      const size_t nInt4ThisItr = (i == nItrs) ? restNInt4 : nInt4PerChunk;
++
++      // Pick a leader
++      uint64_t ret;
++      if (laneId == 0) {
++        ret = atomicAdd(&global_warps_start_semaphore, 1);
++      }
++      ret = __shfl(ret, 0);
 +      // Wait for local warps to produce local RS output
-+      uint64_t chunks_produced;
-+      do {
-+        if (laneId >= (nWarps - 1)) break;
-+        chunks_produced =
-+            __hip_atomic_load(&(local_chunks_produced[laneId]), __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_WORKGROUP);
-+      } while (chunks_produced == expected_chunk);
++      if (ret == (nGlobalWarps - 1)) {
++        uint64_t chunks_produced;
++        do {
++          if (laneId >= nLocalWarps) break;
++          chunks_produced =
++              __hip_atomic_load(&(local_chunks_produced[laneId]), __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_WORKGROUP);
++        } while (chunks_produced == expected_chunk);
++
++        // Sync with global peers before doing AllReduce on this chunk
++        // __syncwarp();
++        if (laneId < static_cast<uint32_t>(nRemotePeers)) {
++          const int peerNodeIdx = (laneId < nodeId) ? laneId : (laneId + 1);
++          int peerIdx = (peerNodeIdx * nLocalRanks) + localRank;
++          if (peerIdx > rank) peerIdx--;
++          memChans[peerIdx].signal();
++          memChans[peerIdx].wait();
++        }
++        // __syncwarp();
++        if (laneId == 0) {
++          // Reset signal to notify other warps
++          __hip_atomic_store(&global_warps_start_semaphore, 0, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_WORKGROUP);
++        }
++      } else {  // warpId > nLocalWarps
++        if (laneId == 0) {
++          while (__hip_atomic_load(&global_warps_start_semaphore, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_WORKGROUP) !=
++                 0) {
++          }
++        }
++      }
 +      expected_chunk++;
 +
-+      // Sync with global peers before doing AllReduce on this chunk
-+      // __syncthreads();
-+      // TODO assume the whole warp works together
-+      if (laneId < static_cast<uint32_t>(nRemotePeers)) {
-+        const int peerNodeIdx = (laneId < nodeId) ? laneId : (laneId + 1);
-+        int peerIdx = (peerNodeIdx * nLocalRanks) + localRank;
-+        if (peerIdx > rank) peerIdx--;
-+        memChans[peerIdx].signal();
-+        memChans[peerIdx].wait();
-+      }
-+      // __syncthreads();
-+
-+      for (size_t idx = laneId; idx < nInt4ThisItr; idx += WARP_SIZE) {
++      for (size_t idx = globalThreadId; idx < nInt4ThisItr; idx += nGlobalThreadsPerBlock) {
 +        int4 data = resultBuff4[(nInt4PerNode * nodeId) + (nInt4PerRank * localRank) + offsetOfThisBlock + idx];
 +        for (int remotePeerIdx = 0; remotePeerIdx < nRemotePeers; remotePeerIdx++) {
 +          const int peerNodeIdx = (remotePeerIdx < nodeId) ? remotePeerIdx : (remotePeerIdx + 1);
@@ -350,16 +375,29 @@ index 1b85136..066a16d 100644
 +        resultBuff4[(nInt4PerNode * nodeId) + (nInt4PerRank * localRank) + offsetOfThisBlock + idx] = data;
 +      }
 +
-+      if (laneId < static_cast<uint32_t>(nRemotePeers)) {
-+        const int peerNodeIdx = (laneId < nodeId) ? laneId : (laneId + 1);
-+        int peerIdx = (peerNodeIdx * nLocalRanks) + localRank;
-+        if (peerIdx > rank) peerIdx--;
-+        memChans[peerIdx].signal();
-+        memChans[peerIdx].wait();
-+      }
-+      // Notify local warps that AG can be done
++      // Pick a leader
 +      if (laneId == 0) {
-+        global_chunks_produced = expected_chunk;
++        ret = atomicAdd(&global_warps_end_semaphore, 1);
++      }
++      ret = __shfl(ret, 0);
++      if (ret == (nGlobalWarps - 1)) {
++        if (laneId < static_cast<uint32_t>(nRemotePeers)) {
++          const int peerNodeIdx = (laneId < nodeId) ? laneId : (laneId + 1);
++          int peerIdx = (peerNodeIdx * nLocalRanks) + localRank;
++          if (peerIdx > rank) peerIdx--;
++          memChans[peerIdx].signal();
++          memChans[peerIdx].wait();
++        }
++        // Notify local warps that AG can be done
++        if (laneId == 0) {
++          global_chunks_produced = expected_chunk;
++          global_warps_end_semaphore = 0;
++        }
++      } else {
++        if (laneId == 0) {
++          while (__hip_atomic_load(&global_warps_end_semaphore, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_WORKGROUP) != 0) {
++          }
++        }
 +      }
 +      offsetOfThisBlock += nInt4PerChunk;
 +    }
@@ -392,7 +430,7 @@ index 1b85136..066a16d 100644
  
    if (sizeof(T) * nelems < worldSize * sizeof(int)) {
      int nBlocks = 7;
-@@ -400,10 +718,9 @@ cudaError_t allreduce(T* buff, T* scratch, T* resultBuff, mscclpp::DeviceHandle<
+@@ -400,10 +756,9 @@ cudaError_t allreduce(T* buff, T* scratch, T* resultBuff, mscclpp::DeviceHandle<
                                                                  channelScratchOffset, rank, nRanksPerNode, worldSize,
                                                                  nelems, flag++);
    } else if (sizeof(T) * nelems <= (1 << 20)) {
@@ -404,7 +442,7 @@ index 1b85136..066a16d 100644
        nThreadsPerBlock = (nelems <= 76800) ? 512 : 1024;
      }
      allreduce7<<<nBlocks, nThreadsPerBlock, 0, stream>>>(buff, scratch, resultBuff, smChannels, channelInOffset,
-@@ -412,9 +729,21 @@ cudaError_t allreduce(T* buff, T* scratch, T* resultBuff, mscclpp::DeviceHandle<
+@@ -412,9 +767,21 @@ cudaError_t allreduce(T* buff, T* scratch, T* resultBuff, mscclpp::DeviceHandle<
    } else {
      int nBlocks = 35;
      int nThreadsPerBlock = 512;
@@ -413,7 +451,7 @@ index 1b85136..066a16d 100644
 -                                                         worldSize, nelems);
 +    if (worldSize > NRANKS_PER_NODE) {
 +      nBlocks = 16;
-+      nThreadsPerBlock = 576;
++      nThreadsPerBlock = 640;
 +      allreduce9<<<nBlocks, nThreadsPerBlock, 0, stream>>>(buff, resultBuff, smChannels, smOutChannels,
 +                                                           channelOutOffset, rank, nRanksPerNode, worldSize, nelems);
 +    } else {
